@@ -154,6 +154,23 @@ The only authoritative confirmation of payment is the **HMAC-SHA256 signed serve
   }
   ```
 
+### Delivery Guarantees & Idempotency
+
+Webhook delivery is durable, and the gateway assumes your endpoint may receive the same event
+more than once:
+
+- **Intent persisted before send**: the delivery record (delivery id, endpoint, exact signed body)
+  is written to `webhook_deliveries` before the HTTP request leaves the gateway. If the process
+  stops between your endpoint answering and the outcome being recorded, the record survives and
+  the retry worker completes the delivery.
+- **Retries**: failed deliveries are retried with exponential backoff (5s, 30s, 2m, 10m, 1h) up to
+  5 attempts, then left with `next_retry_at` unset for operator follow-up.
+- **Stable identity across retries**: every retry resends the **identical body** and keeps the
+  original `X-Gateway-Delivery-Id` and `X-Gateway-Timestamp`, so a retried request verifies against
+  the same signature as the first attempt.
+- **Deduplicate on `X-Gateway-Delivery-Id`**: because a retry can arrive after your endpoint has
+  already processed the event, store the delivery id and skip an id you have seen before.
+
 ### Verification Security Invariants:
 - **Raw Body Required**: Consumers **MUST** compute the HMAC over raw, unparsed request bytes. Never parse JSON before HMAC calculation.
 - **Constant-Time Comparison**: Protect against timing side-channel attacks by always using constant-time comparison functions:
