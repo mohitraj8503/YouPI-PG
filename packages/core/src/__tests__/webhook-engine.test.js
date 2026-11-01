@@ -112,6 +112,126 @@ describe('Webhook Engine Integration Tests', () => {
     assert.equal(delivery.response_status, 200);
   });
 
+  test('persists the delivery intent before the webhook request is sent', async () => {
+    const merchant = merchantRepo.create({
+      businessName: 'Intent Store',
+      slug: 'intent-store',
+      contactEmail: 'intent@example.com',
+      contactPhone: '9876543210',
+      webhookUrl: `http://localhost:${receiverPort}/webhook-intent`,
+      webhookSecret: 'test_secret_for_intent_store_123'
+    });
+
+    const session = sessionRepo.create({
+      merchantId: merchant.id,
+      orderId: 'HOOK-ORD-INTENT',
+      amountPaise: 15000n
+    });
+
+    // Inspect the database at the moment the request leaves, which is the only point where
+    // "persisted before send" is observable.
+    const realFetch = globalThis.fetch;
+    let rowDuringSend = null;
+    let bodyDuringSend = null;
+    let deliveryIdDuringSend = null;
+
+    globalThis.fetch = async (url, init) => {
+      bodyDuringSend = init.body;
+      deliveryIdDuringSend = init.headers['X-Gateway-Delivery-Id'];
+      rowDuringSend = db.queryOne('SELECT * FROM webhook_deliveries WHERE id = ?', [deliveryIdDuringSend]);
+      return { ok: true, status: 200, text: async () => '{"received":true}' };
+    };
+
+    let result;
+    try {
+      result = await webhookEngine.dispatch('SUCCESS', session);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    assert.equal(result.delivered, true);
+    assert.ok(rowDuringSend, 'the delivery intent must exist before the webhook is sent');
+    assert.equal(rowDuringSend.id, deliveryIdDuringSend);
+    assert.equal(rowDuringSend.payload, bodyDuringSend, 'the persisted body must be the body that was sent');
+    assert.equal(rowDuringSend.event_type, 'SUCCESS');
+    assert.equal(rowDuringSend.endpoint_url, merchant.webhookUrl);
+    assert.equal(rowDuringSend.attempt_count, 1);
+    assert.equal(rowDuringSend.is_successful, 0);
+    assert.ok(rowDuringSend.next_retry_at, 'an unrecorded delivery must be scheduled for a retry');
+
+    // The outcome is recorded against that same row, not a second one.
+    const rows = db.query('SELECT * FROM webhook_deliveries WHERE payment_id = ?', [session.id]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].is_successful, 1);
+    assert.equal(rows[0].response_status, 200);
+    assert.equal(rows[0].next_retry_at, null);
+  });
+
+  test('finishes a dispatch interrupted before its outcome was recorded', async () => {
+    const merchant = merchantRepo.create({
+      businessName: 'Interrupted Store',
+      slug: 'interrupted-store',
+      contactEmail: 'interrupted@example.com',
+      contactPhone: '9876543210',
+      webhookUrl: `http://localhost:${receiverPort}/webhook-interrupted`,
+      webhookSecret: 'test_secret_for_interrupted_store_123'
+    });
+
+    const session = sessionRepo.create({
+      merchantId: merchant.id,
+      orderId: 'HOOK-ORD-INTERRUPTED',
+      amountPaise: 30000n
+    });
+
+    receivedWebhooks = [];
+    shouldReceiverFail = false;
+
+    // Simulate the process dying after the merchant received the webhook but before the
+    // outcome was written back: the send succeeds, the settle step throws.
+    const realExecute = db.execute.bind(db);
+    db.execute = (sql, params) => {
+      if (String(sql).includes('UPDATE webhook_deliveries')) {
+        throw new Error('simulated process death before the outcome was recorded');
+      }
+      return realExecute(sql, params);
+    };
+
+    try {
+      await assert.rejects(
+        () => webhookEngine.dispatch('SUCCESS', session),
+        /simulated process death/
+      );
+    } finally {
+      db.execute = realExecute;
+    }
+
+    const interrupted = db.queryOne('SELECT * FROM webhook_deliveries WHERE payment_id = ?', [session.id]);
+    assert.ok(interrupted, 'the interrupted delivery must survive as a pending record');
+    assert.equal(interrupted.is_successful, 0);
+    assert.equal(interrupted.response_status, null);
+    assert.equal(receivedWebhooks.length, 1, 'the first attempt did reach the merchant');
+
+    // Once the claim lock has elapsed the retry worker owns the delivery and completes it.
+    db.execute('UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?', [
+      new Date(Date.now() - 60000).toISOString(), interrupted.id
+    ]);
+    const retryResults = await webhookEngine.retryPending();
+    assert.equal(retryResults.length, 1);
+    assert.equal(retryResults[0].success, true);
+
+    const retried = receivedWebhooks[receivedWebhooks.length - 1];
+    assert.equal(retried.headers['x-gateway-delivery-id'], interrupted.id,
+      'a recovered delivery keeps its delivery id so the merchant can deduplicate it');
+    assert.equal(retried.body.event, 'SUCCESS');
+    assert.equal(retried.body.orderId, 'HOOK-ORD-INTERRUPTED');
+    const retrySig = retried.headers['x-gateway-signature'].replace('sha256=', '');
+    assert.equal(verifyHmac(JSON.stringify(retried.body), merchant.webhookSecret, retrySig), true);
+
+    const settled = db.queryOne('SELECT * FROM webhook_deliveries WHERE id = ?', [interrupted.id]);
+    assert.equal(settled.is_successful, 1);
+    assert.equal(settled.attempt_count, 2);
+  });
+
   test('carries the bank reference (UTR) from the attributed observation', async () => {
     const merchant = merchantRepo.create({
       businessName: 'UTR Store',

@@ -123,6 +123,28 @@ export class WebhookEngine {
       'X-Gateway-Timestamp': timestamp
     };
 
+    // 4. Persist the delivery intent BEFORE the request leaves the process. If the process dies
+    // between the merchant receiving the webhook and the outcome being recorded, the row is
+    // still there with the exact signed body, so the retry worker finishes the delivery instead
+    // of losing it. `next_retry_at` doubles as the claim lock (the same 60s window
+    // `retryPending` uses) so a dispatch that is still in flight is never retried concurrently.
+    const intentClaimIso = new Date(Date.now() + 60000).toISOString();
+    this.db.execute(`
+      INSERT INTO webhook_deliveries (
+        id, merchant_id, payment_id, event_type, payload, endpoint_url,
+        response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 1, 0, ?, ?)
+    `, [
+      deliveryId,
+      merchant.id,
+      session.id,
+      publicOutcome,
+      payloadString,
+      merchant.webhookUrl,
+      intentClaimIso,
+      nowIso
+    ]);
+
     let responseStatus = null;
     let responseBody = null;
     let isSuccessful = false;
@@ -144,28 +166,22 @@ export class WebhookEngine {
       responseBody = err.message || 'Network timeout';
     }
 
-    // Persist delivery record in webhook_deliveries
+    // Record the outcome against the intent row persisted above. `attempt_count` was already
+    // set by that insert, so this only settles the result and schedules the next retry.
     const nextRetryAt = isSuccessful
       ? null
       : new Date(Date.now() + 5000).toISOString(); // initial 5s backoff
 
     this.db.execute(`
-      INSERT INTO webhook_deliveries (
-        id, merchant_id, payment_id, event_type, payload, endpoint_url,
-        response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      UPDATE webhook_deliveries
+      SET response_status = ?, response_body = ?, is_successful = ?, next_retry_at = ?
+      WHERE id = ?
     `, [
-      deliveryId,
-      merchant.id,
-      session.id,
-      publicOutcome,
-      payloadString,
-      merchant.webhookUrl,
       responseStatus,
       responseBody,
       isSuccessful ? 1 : 0,
       nextRetryAt,
-      nowIso
+      deliveryId
     ]);
 
     return {
